@@ -1501,6 +1501,76 @@ class MotionLibBase:
         )
         self.dof_vel = torch.cat([m.dof_vels for m in motions], dim=0).float().to(self._device)
         self.feet_l = torch.cat([m.feet_l for m in motions], dim=0).float().to(self._device)
+
+        # MJCF-FK OVERRIDE: replace SOMA FK-derived body_pos/quat with MuJoCo-FK values
+        # so motion_lib references match what the simulator produces for the same joint angles.
+        if self.m_cfg.get("use_mjfk_override", False):
+            import numpy as _np
+            pkl_dir = str(self.m_cfg.get("motion_file", ""))
+            # Build key->npz path index once (avoid O(N*tree_size) os.walk on hot loop).
+            npz_index = {}
+            for root, _, files in os.walk(pkl_dir):
+                for f in files:
+                    if f.endswith(".mjfk.npz"):
+                        npz_index[f[:-len(".mjfk.npz")]] = os.path.join(root, f)
+            logger.info(f"[mjfk_override] indexed {len(npz_index)} npz files under {pkl_dir}")
+
+            replaced = 0; skipped_missing = 0; skipped_bad = 0; t_mismatch = 0
+            start_idx = 0
+            for i, m in enumerate(motions):
+                T_i = m.global_translation.shape[0]
+                actual_idx = int(self._curr_motion_ids[i].item()) if self._curr_motion_ids is not None else i
+                key = str(self._motion_data_keys[actual_idx])
+                npz_path = npz_index.get(key)
+                if npz_path is None:
+                    skipped_missing += 1
+                    start_idx += T_i
+                    continue
+                try:
+                    data = _np.load(npz_path)
+                    bp_np = data["body_pos"]
+                    bq_np = data["body_quat_xyzw"]
+                    bv_np = data["body_lin_vel"]
+                except Exception as e:
+                    logger.warning(f"[mjfk_override] load fail {key}: {e}")
+                    skipped_bad += 1
+                    start_idx += T_i
+                    continue
+                # Validate: finite + unit-norm quats (protects quat_inverse from bad inputs)
+                if not (_np.isfinite(bp_np).all() and _np.isfinite(bq_np).all() and _np.isfinite(bv_np).all()):
+                    logger.warning(f"[mjfk_override] non-finite values in {key}, skipping")
+                    skipped_bad += 1
+                    start_idx += T_i
+                    continue
+                qnorm = _np.linalg.norm(bq_np, axis=-1)
+                if (qnorm < 1e-6).any() or (_np.abs(qnorm - 1.0) > 1e-2).any():
+                    logger.warning(f"[mjfk_override] bad quat norms in {key} (min={qnorm.min():.4f} max={qnorm.max():.4f}), skipping")
+                    skipped_bad += 1
+                    start_idx += T_i
+                    continue
+                bp = torch.from_numpy(bp_np).float().to(self._device)
+                bq = torch.from_numpy(bq_np).float().to(self._device)
+                bv = torch.from_numpy(bv_np).float().to(self._device)
+                T_copy = min(bp.shape[0], T_i)
+                if bp.shape[0] != T_i:
+                    t_mismatch += 1
+                self.body_pos_w[start_idx:start_idx + T_copy] = bp[:T_copy]
+                self.body_quat_w[start_idx:start_idx + T_copy] = bq[:T_copy]
+                self.body_lin_vel_w[start_idx:start_idx + T_copy] = bv[:T_copy]
+                replaced += 1
+                start_idx += T_i
+
+            logger.info(
+                f"[mjfk_override] replaced={replaced}/{len(motions)} "
+                f"skipped_missing={skipped_missing} skipped_bad={skipped_bad} T_mismatch={t_mismatch}"
+            )
+            if replaced == 0:
+                raise RuntimeError(
+                    f"[mjfk_override] enabled but replaced 0/{len(motions)} motions. "
+                    f"Likely the npz files under motion_file={pkl_dir!r} don't match "
+                    f"the motion keys being sampled. Preprocess the dataset first, or "
+                    f"set use_mjfk_override=False."
+                )
         self.feet_r = torch.cat([m.feet_r for m in motions], dim=0).float().to(self._device)
 
         # if "global_translation_extend" in motions[0].__dict__:
@@ -1608,6 +1678,131 @@ class MotionLibBase:
             )
             self.body_lin_vel_w_full = self.body_lin_vel_w[:, self.m_cfg.mujoco_to_isaaclab_body]
             self.body_ang_vel_w_full = self.body_ang_vel_w[:, self.m_cfg.mujoco_to_isaaclab_body]
+
+            # STATIC PER-BODY OFFSET FROM PRECOMPUTED JSON (disabled — faulty FK residual)
+            offset_json = self.m_cfg.get("body_offset_correction_path", None)
+            if offset_json is not None:
+                try:
+                    import json as _json
+                    import os as _os
+                    if _os.path.exists(offset_json):
+                        HU_D04_MJ_BODY_NAMES = [
+                            "base_link","left_hip_pitch_link","left_hip_roll_link","left_hip_yaw_link",
+                            "left_knee_link","left_ankle_pitch_link","left_ankle_roll_link",
+                            "right_hip_pitch_link","right_hip_roll_link","right_hip_yaw_link",
+                            "right_knee_link","right_ankle_pitch_link","right_ankle_roll_link",
+                            "waist_yaw_link","waist_roll_link","waist_pitch_link",
+                            "head_yaw_link","head_pitch_link",
+                            "left_shoulder_pitch_link","left_shoulder_roll_link","left_shoulder_yaw_link",
+                            "left_elbow_link","left_wrist_yaw_link","left_wrist_pitch_link","left_wrist_roll_link",
+                            "right_shoulder_pitch_link","right_shoulder_roll_link","right_shoulder_yaw_link",
+                            "right_elbow_link","right_wrist_yaw_link","right_wrist_pitch_link","right_wrist_roll_link",
+                        ]
+                        offsets_dict = _json.load(open(offset_json))
+                        # Build offset_tensor in IsaacLab order (matches body_pos_w_full layout)
+                        mj_to_il = self.m_cfg.mujoco_to_isaaclab_body
+                        offset_t = torch.zeros(self.num_bodies_full, 3,
+                            device=self.body_pos_w_full.device,
+                            dtype=self.body_pos_w_full.dtype)
+                        applied = 0
+                        for body_name, offset_vec in offsets_dict.items():
+                            if body_name in HU_D04_MJ_BODY_NAMES:
+                                mj_idx = HU_D04_MJ_BODY_NAMES.index(body_name)
+                                il_idx = mj_to_il[mj_idx] if isinstance(mj_to_il, list) else int(mj_to_il[mj_idx])
+                                offset_t[il_idx] = torch.tensor(offset_vec,
+                                    device=offset_t.device, dtype=offset_t.dtype)
+                                applied += 1
+                        # Apply correction: body_pos_w_full = stored - (stored - sim) = sim
+                        # Rotate offset by per-frame root quat so base-frame offset becomes world-frame.
+                        T_ = self.body_pos_w_full.shape[0]
+                        root_q = self.body_quat_w_full[:, 0, :]  # (T,4) wxyz
+                        from gear_sonic.isaac_utils import rotations as _rot
+                        off_exp = offset_t.unsqueeze(0).expand(T_, -1, -1)
+                        rq = root_q.unsqueeze(1).expand(-1, self.num_bodies_full, -1).reshape(-1, 4)
+                        off_flat = off_exp.reshape(-1, 3)
+                        off_rot = _rot.quat_rotate(rq, off_flat, w_last=False).reshape(T_, self.num_bodies_full, 3)
+                        self.body_pos_w_full = self.body_pos_w_full - off_rot
+                        total_mag = float(torch.linalg.norm(offset_t, dim=-1).sum())
+                        logger.info(f"[body_offset_correction] applied {applied} bodies, total |mag|={total_mag*100:.1f}cm")
+                except Exception as e:
+                    logger.warning(f"[body_offset_correction] FAILED: {e}; continuing without")
+
+            # AUTO STATIC PER-BODY OFFSET (HU_D04)
+            # Measures stored_body_pos - sim_FK_body_pos at frame 0 of N motions, averages,
+            # subtracts from body_pos_w_full so reference matches simulator's actual FK output.
+            if self.m_cfg.get("auto_body_offset", False):
+                try:
+                    import mujoco as _mj
+                    import numpy as _np
+                    mjcf_path = self.m_cfg.get("auto_body_offset_mjcf",
+                        "/root/GR00T-WholeBodyControl/gear_sonic/data/assets/robot_description/mjcf/hu_d04.xml")
+                    n_samples = int(self.m_cfg.get("auto_body_offset_samples", 30))
+                    mj_model = _mj.MjModel.from_xml_path(mjcf_path)
+                    mj_data = _mj.MjData(mj_model)
+                    mj_il = self.m_cfg.mujoco_to_isaaclab_body
+                    n_bodies = self.num_bodies_full
+                    # Sample first frame of first n_samples motions
+                    motion_starts = self._motion_lengths.cumsum(0)
+                    n_motions = min(n_samples, len(self._motion_lengths))
+                    sim_positions = []
+                    for i in range(n_motions):
+                        start_idx = 0 if i == 0 else int(motion_starts[i-1].item())
+                        # dof_pos[start_idx] is now in IsaacLab order (already permuted above)
+                        # We need MuJoCo order to apply via qpos. Reverse the permutation.
+                        dof_il = self.dof_pos[start_idx].cpu().numpy()  # (31,) IL order
+                        # Rebuild MJ-order dof: dof_mj[j] = dof_il[mj_to_il[j]]
+                        # But mj_to_il maps MJ index → IL index, so:
+                        dof_mj = _np.array([dof_il[mj_il[j]] for j in range(len(mj_il)-1)])  # 31 actuated
+                        # Root pose at frame 0 from body_pos_w_full[start_idx, 0] (base_link)
+                        root_pos = self.body_pos_w_full[start_idx, 0].cpu().numpy()
+                        root_quat_wxyz = self.body_quat_w_full[start_idx, 0].cpu().numpy()
+                        mj_data.qpos[:] = 0
+                        mj_data.qpos[0:3] = root_pos
+                        mj_data.qpos[3:7] = root_quat_wxyz
+                        # Apply 31 DOFs in MuJoCo order (skip the first MJ index 0 = root freejoint body)
+                        # Actually we have 31 actuated joints, MJ joint indices start after freejoint
+                        for j_idx in range(31):
+                            jadr = mj_model.jnt_qposadr[j_idx + 1]  # +1 to skip freejoint
+                            mj_data.qpos[jadr] = float(dof_mj[j_idx]) if j_idx < len(dof_mj) else 0.0
+                        _mj.mj_forward(mj_model, mj_data)
+                        # Sim body positions in MJ order (32 bodies)
+                        sim_pos_mj = _np.array([mj_data.xpos[b].copy() for b in range(n_bodies)])
+                        # Permute to IL order: sim_pos_il[i] = sim_pos_mj[mj_idx_for_il_position_i]
+                        # mj_to_il[mj_idx] = il_idx, so for il_idx i, find mj_idx where mj_to_il[mj_idx]==i
+                        sim_pos_il = _np.zeros_like(sim_pos_mj)
+                        for mj_idx in range(n_bodies):
+                            il_idx = mj_il[mj_idx]
+                            sim_pos_il[il_idx] = sim_pos_mj[mj_idx]
+                        sim_positions.append(sim_pos_il)
+                    sim_arr = _np.stack(sim_positions, axis=0)  # (N, 32, 3)
+                    # Stored positions (already in IL order in body_pos_w_full)
+                    stored_starts = []
+                    for i in range(n_motions):
+                        start_idx = 0 if i == 0 else int(motion_starts[i-1].item())
+                        stored_starts.append(self.body_pos_w_full[start_idx].cpu().numpy())
+                    stored_arr = _np.stack(stored_starts, axis=0)  # (N, 32, 3)
+                    # Per-body mean offset = stored - sim (in world frame, but motions have varying root → use base-relative)
+                    base_rel_stored = stored_arr - stored_arr[:, 0:1, :]   # subtract base_link pos
+                    base_rel_sim = sim_arr - sim_arr[:, 0:1, :]
+                    offset_base_rel = (base_rel_stored - base_rel_sim).mean(axis=0)  # (32, 3)
+                    offset_norms = _np.linalg.norm(offset_base_rel, axis=-1)
+                    logger.info(f"[auto_body_offset] computed from {n_motions} motions, mean per-body offset magnitudes:")
+                    for il_idx in range(n_bodies):
+                        if offset_norms[il_idx] > 0.005:
+                            logger.info(f"  IL[{il_idx}] offset={offset_base_rel[il_idx].round(4).tolist()} |mag|={offset_norms[il_idx]*100:.2f}cm")
+                    # Apply: rotate offset by per-frame root quat and subtract from body_pos_w_full
+                    offset_t = torch.tensor(offset_base_rel, device=self.body_pos_w_full.device, dtype=self.body_pos_w_full.dtype)
+                    T_ = self.body_pos_w_full.shape[0]
+                    root_q = self.body_quat_w_full[:, 0, :]  # (T,4) wxyz
+                    from gear_sonic.isaac_utils import rotations as _rot
+                    off_exp = offset_t.unsqueeze(0).expand(T_, -1, -1)
+                    rq = root_q.unsqueeze(1).expand(-1, n_bodies, -1).reshape(-1, 4)
+                    off_flat = off_exp.reshape(-1, 3)
+                    off_rot = _rot.quat_rotate(rq, off_flat, w_last=False).reshape(T_, n_bodies, 3)
+                    self.body_pos_w_full = self.body_pos_w_full - off_rot
+                    logger.info(f"[auto_body_offset] applied; mean total |offset|={offset_norms.sum()*100:.1f}cm")
+                except Exception as e:
+                    logger.warning(f"[auto_body_offset] FAILED: {e}; continuing without correction")
 
             # Slice to only selected body_indexes
             self.body_pos_w = self.body_pos_w_full[:, self.body_indexes]

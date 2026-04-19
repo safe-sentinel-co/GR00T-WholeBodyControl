@@ -168,7 +168,7 @@ class Humanoid_Batch:
         joints = sorted(
             [j.attrib["name"] for j in tree.getroot().find("worldbody").findall(".//joint")]
         )
-        motors = sorted([m.attrib["name"] for m in tree.getroot().find("actuator").getchildren()])
+        motors = sorted([m.attrib["name"] for m in tree.getroot().find("actuator").getchildren() if "name" in m.attrib])
 
         assert len(motors) > 0, "No motors found in the mjcf file"
 
@@ -196,15 +196,15 @@ class Humanoid_Batch:
             and tree.getroot().find("worldbody").findall(".//joint")[0].attrib["type"] == "free"
         ):
             for j in tree.getroot().find("worldbody").findall(".//joint")[1:]:
-                self.dof_axis.append([int(i) for i in j.attrib["axis"].split(" ")])
+                self.dof_axis.append([float(i) for i in j.attrib["axis"].split(" ")])
             self.has_freejoint = True
         elif "type" not in tree.getroot().find("worldbody").findall(".//joint")[0].attrib:
             for j in tree.getroot().find("worldbody").findall(".//joint"):
-                self.dof_axis.append([int(i) for i in j.attrib["axis"].split(" ")])
+                self.dof_axis.append([float(i) for i in j.attrib["axis"].split(" ")])
             self.has_freejoint = True
         else:
             for j in tree.getroot().find("worldbody").findall(".//joint")[6:]:
-                self.dof_axis.append([int(i) for i in j.attrib["axis"].split(" ")])
+                self.dof_axis.append([float(i) for i in j.attrib["axis"].split(" ")])
             self.has_freejoint = False
 
         self.dof_axis = torch.tensor(self.dof_axis)

@@ -477,6 +477,10 @@ class TrackingCommand(CommandTerm):
 
         self.metrics["error_anchor_pos"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_anchor_rot"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_anchor_tilt"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_anchor_tilt_pitch"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_anchor_tilt_roll"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_anchor_yaw"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_anchor_lin_vel"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_anchor_ang_vel"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_body_pos"] = torch.zeros(self.num_envs, device=self.device)
@@ -2406,6 +2410,36 @@ class TrackingCommand(CommandTerm):
         self.metrics["error_anchor_rot"] = quat_error_magnitude(
             self.anchor_quat_w, self.robot_anchor_quat_w
         )
+        # Decompose anchor rotation error into heading (yaw) vs tilt (pitch+roll)
+        # to diagnose which component drives termination.
+        # Apply each quat to the world Z axis; compare resulting up-vectors → tilt.
+        # Apply each quat to world X axis (project to XY plane); compare → heading.
+        ref_q = self.anchor_quat_w
+        rob_q = self.robot_anchor_quat_w
+        z_world = torch.tensor([0.0, 0.0, 1.0], device=ref_q.device).expand(ref_q.shape[0], 3)
+        x_world = torch.tensor([1.0, 0.0, 0.0], device=ref_q.device).expand(ref_q.shape[0], 3)
+        ref_up = quat_apply(ref_q, z_world)
+        rob_up = quat_apply(rob_q, z_world)
+        cos_tilt = torch.sum(ref_up * rob_up, dim=-1).clamp(-1.0, 1.0)
+        self.metrics["error_anchor_tilt"] = torch.acos(cos_tilt)
+        # Directional tilt: project (rob_up - ref_up) onto ref_forward (X) and ref_left (Y) axes.
+        ref_fwd_3 = quat_apply(ref_q, x_world)
+        y_world = torch.tensor([0.0, 1.0, 0.0], device=ref_q.device).expand(ref_q.shape[0], 3)
+        ref_left_3 = quat_apply(ref_q, y_world)
+        delta_up = rob_up - ref_up
+        # +pitch_err = robot is leaning forward (rob_up has fwd component vs ref)
+        self.metrics["error_anchor_tilt_pitch"] = torch.sum(delta_up * ref_fwd_3, dim=-1)
+        # +roll_err = robot is leaning left (rob_up has left component vs ref)
+        self.metrics["error_anchor_tilt_roll"] = torch.sum(delta_up * ref_left_3, dim=-1)
+        ref_fwd = quat_apply(ref_q, x_world)
+        rob_fwd = quat_apply(rob_q, x_world)
+        # project forward vectors onto XY plane (ignore z) for heading delta
+        ref_fwd_xy = ref_fwd[:, :2]
+        rob_fwd_xy = rob_fwd[:, :2]
+        ref_fwd_xy_n = ref_fwd_xy / (ref_fwd_xy.norm(dim=-1, keepdim=True) + 1e-8)
+        rob_fwd_xy_n = rob_fwd_xy / (rob_fwd_xy.norm(dim=-1, keepdim=True) + 1e-8)
+        cos_yaw = (ref_fwd_xy_n * rob_fwd_xy_n).sum(dim=-1).clamp(-1.0, 1.0)
+        self.metrics["error_anchor_yaw"] = torch.acos(cos_yaw)
         self.metrics["error_anchor_lin_vel"] = torch.norm(
             self.anchor_lin_vel_w - self.robot_anchor_lin_vel_w, dim=-1
         )
