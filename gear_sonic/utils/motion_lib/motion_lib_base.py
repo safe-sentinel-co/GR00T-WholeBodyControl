@@ -1667,17 +1667,25 @@ class MotionLibBase:
         torch.cuda.empty_cache()
 
         if "mujoco_to_isaaclab_body" in self.m_cfg.keys():  # noqa: SIM118
-            self.dof_pos = self.dof_pos[:, self.m_cfg.mujoco_to_isaaclab_dof]
-            self.dof_vel = self.dof_vel[:, self.m_cfg.mujoco_to_isaaclab_dof]
+            # Input arrays (dof_pos/body_pos_w) are in MuJoCo (MJCF DFS) order;
+            # we want them in IsaacLab order for downstream consumption.
+            # Numpy/torch fancy-indexing: result[i] = input[index[i]].
+            # To produce IL-ordered output, index[i_IL] must be the MJ index that
+            # corresponds to IL slot i — that is `isaaclab_to_mujoco_*`, NOT
+            # `mujoco_to_isaaclab_*`. (Previously used the wrong direction,
+            # scrambling body/dof positions into wrong slots and producing
+            # ~50cm error_body_pos at every reset despite correct FK parity.)
+            self.dof_pos = self.dof_pos[:, self.m_cfg.isaaclab_to_mujoco_dof]
+            self.dof_vel = self.dof_vel[:, self.m_cfg.isaaclab_to_mujoco_dof]
 
             # Keep full body data (all bodies, IsaacLab order) before slicing
-            self.num_bodies_full = len(self.m_cfg.mujoco_to_isaaclab_body)
-            self.body_pos_w_full = self.body_pos_w[:, self.m_cfg.mujoco_to_isaaclab_body]
+            self.num_bodies_full = len(self.m_cfg.isaaclab_to_mujoco_body)
+            self.body_pos_w_full = self.body_pos_w[:, self.m_cfg.isaaclab_to_mujoco_body]
             self.body_quat_w_full = rotations.xyzw_to_wxyz(
-                self.body_quat_w[:, self.m_cfg.mujoco_to_isaaclab_body]
+                self.body_quat_w[:, self.m_cfg.isaaclab_to_mujoco_body]
             )
-            self.body_lin_vel_w_full = self.body_lin_vel_w[:, self.m_cfg.mujoco_to_isaaclab_body]
-            self.body_ang_vel_w_full = self.body_ang_vel_w[:, self.m_cfg.mujoco_to_isaaclab_body]
+            self.body_lin_vel_w_full = self.body_lin_vel_w[:, self.m_cfg.isaaclab_to_mujoco_body]
+            self.body_ang_vel_w_full = self.body_ang_vel_w[:, self.m_cfg.isaaclab_to_mujoco_body]
 
             # STATIC PER-BODY OFFSET FROM PRECOMPUTED JSON (disabled — faulty FK residual)
             offset_json = self.m_cfg.get("body_offset_correction_path", None)

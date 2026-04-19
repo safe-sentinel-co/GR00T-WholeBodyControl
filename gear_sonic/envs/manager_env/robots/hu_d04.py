@@ -53,14 +53,14 @@ HU_D04_ISAACLAB_JOINTS = [
     "waist_pitch_link",             # 9
     "left_knee_link",               # 10
     "right_knee_link",              # 11
-    "left_shoulder_pitch_link",     # 12
-    "right_shoulder_pitch_link",    # 13
-    "head_yaw_link",                # 14
+    "head_yaw_link",                # 12  (empirically verified via body_names print)
+    "left_shoulder_pitch_link",     # 13
+    "right_shoulder_pitch_link",    # 14
     "left_ankle_pitch_link",        # 15
     "right_ankle_pitch_link",       # 16
-    "left_shoulder_roll_link",      # 17
-    "right_shoulder_roll_link",     # 18
-    "head_pitch_link",              # 19
+    "head_pitch_link",              # 17
+    "left_shoulder_roll_link",      # 18
+    "right_shoulder_roll_link",     # 19
     "left_ankle_roll_link",         # 20
     "right_ankle_roll_link",        # 21
     "left_shoulder_yaw_link",       # 22
@@ -264,19 +264,31 @@ HU_D04_CFG = ArticulationCfg(
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        # HU_D04-tuned crouched ready-stance: legs bent (G1-like), arms bent FORWARD.
-        # Shoulder_pitch and elbow signs are FLIPPED from G1 because HU_D04's joint axes
-        # are opposite (+pitch on HU_D04 rotates arm backward, not forward like G1).
+        # Dataset-calibrated neutral stance: joint defaults match the MEDIAN
+        # of motion frame 0 across 200 random motions, so the PD target
+        # (action*scale + default) aligns with what RSI sets at reset. Prevents
+        # the "PD drives knees back to crouch → robot sinks" failure we saw
+        # in the env-0 trace (robot_z dropping 20-30cm in 13-40 steps).
+        #   Previous: knee 0.669 rad (38° bent), hip_pitch -0.312 (heavy crouch)
+        #   Dataset median:   knee 0.09  (5° bent),  hip_pitch +0.06 (nearly neutral)
         pos=(0.0, 0.0, 0.87),
         joint_pos={
-            ".*_hip_pitch_joint": -0.312,
-            ".*_knee_joint": 0.669,
-            ".*_ankle_pitch_joint": -0.363,
-            ".*_elbow_joint": -0.6,              # flipped from G1's +0.6
-            "left_shoulder_roll_joint": 0.2,
-            "left_shoulder_pitch_joint": -0.2,   # flipped from G1's +0.2
-            "right_shoulder_roll_joint": -0.2,
-            "right_shoulder_pitch_joint": -0.2,  # flipped from G1's +0.2
+            ".*_hip_pitch_joint": 0.06,
+            ".*_hip_yaw_joint": 0.0,
+            "left_hip_roll_joint": 0.03,
+            "right_hip_roll_joint": -0.03,
+            ".*_knee_joint": 0.09,
+            ".*_ankle_pitch_joint": -0.15,
+            "left_ankle_roll_joint": -0.06,
+            "right_ankle_roll_joint": 0.07,
+            "waist_.*_joint": 0.0,
+            ".*_elbow_joint": -0.64,
+            "left_shoulder_pitch_joint": 0.11,
+            "right_shoulder_pitch_joint": 0.08,
+            "left_shoulder_roll_joint": 0.38,
+            "right_shoulder_roll_joint": -0.38,
+            "left_shoulder_yaw_joint": -0.42,
+            "right_shoulder_yaw_joint": 0.47,
         },
         joint_vel={".*": 0.0},
     ),

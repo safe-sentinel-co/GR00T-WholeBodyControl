@@ -51,6 +51,33 @@ class TerminationsCfg:
     grasp_failure_after_contact = None
 
 
+_TERM_DBG_MAX = 40
+_TERM_DBG_COUNTER = {"n": 0}
+
+
+def _dbg_term(term_name: str, env, command, fired: torch.Tensor, detail: str):
+    """Append a single line to /workspace/logs/terminations.log for env 0 firings.
+
+    Captures the first ~40 times any termination fires for env 0, with step,
+    motion key, and a per-term detail string. Bounded to avoid flooding.
+    """
+    if _TERM_DBG_COUNTER["n"] >= _TERM_DBG_MAX:
+        return
+    try:
+        if bool(fired[0].item()):
+            _TERM_DBG_COUNTER["n"] += 1
+            t_now = int(command.time_steps[0].item())
+            mid = int(command.motion_ids[0].item())
+            try:
+                mkey = str(command.motion_lib.curr_motion_keys[mid])
+            except Exception:
+                mkey = f"id={mid}"
+            with open("/workspace/logs/terminations.log", "a") as _f:
+                _f.write(f"[{_TERM_DBG_COUNTER['n']:2d}] term={term_name:18s} step={t_now:3d} motion={mkey:50s} {detail}\n")
+    except Exception:
+        pass
+
+
 def exceeded_anchor_pos(
     env: ManagerBasedRLEnv, command_name: str, threshold: float
 ) -> torch.Tensor:
@@ -69,7 +96,12 @@ def exceeded_anchor_pos(
     """
     command: TrackingCommand = env.command_manager.get_term(command_name)
     pos_diff = command.anchor_pos_w - command.robot_anchor_pos_w
-    return pos_diff.norm(dim=1).gt(threshold)
+    norms = pos_diff.norm(dim=1)
+    fired = norms.gt(threshold)
+    _dbg_term("anchor_pos", env, command, fired,
+              f"err={float(norms[0].item())*100:.1f}cm threshold={threshold*100:.0f}cm  "
+              f"robot_anchor={command.robot_anchor_pos_w[0].tolist()} motion_anchor={command.anchor_pos_w[0].tolist()}")
+    return fired
 
 
 def exceeded_anchor_pos_xy(
@@ -176,7 +208,13 @@ def exceeded_anchor_ori(
     """
     command: TrackingCommand = env.command_manager.get_term(command_name)
     angular_err = quat_error_magnitude(command.anchor_quat_w, command.robot_anchor_quat_w)
-    return angular_err.square().gt(threshold)
+    sq = angular_err.square()
+    fired = sq.gt(threshold)
+    import math as _math
+    _dbg_term("anchor_ori_full", env, command, fired,
+              f"angular_err={float(angular_err[0].item()):.3f}rad ({_math.degrees(float(angular_err[0].item())):.1f}°) "
+              f"sq_err={float(sq[0].item()):.3f} threshold={threshold:.3f}")
+    return fired
 
 
 def exceeded_body_pos(
@@ -200,7 +238,22 @@ def exceeded_body_pos(
     command: TrackingCommand = env.command_manager.get_term(command_name)
     tracked = _get_body_indexes(command, body_names)
     pos_diff = command.body_pos_relative_w[:, tracked] - command.robot_body_pos_w[:, tracked]
-    return pos_diff.norm(dim=-1).gt(threshold).any(dim=-1)
+    norms = pos_diff.norm(dim=-1)
+    fired = norms.gt(threshold).any(dim=-1)
+    if _TERM_DBG_COUNTER["n"] < _TERM_DBG_MAX and bool(fired[0].item()):
+        try:
+            per_body = norms[0].detach().cpu().numpy()
+            names_used = [command.cfg.body_names[i] for i in tracked]
+            worst_idx = int(per_body.argmax())
+            _dbg_term(
+                f"body_pos({body_names})" if body_names else "body_pos(all)",
+                env, command, fired,
+                f"worst={names_used[worst_idx]} err={per_body[worst_idx]*100:.1f}cm threshold={threshold*100:.0f}cm "
+                f"all_tracked=[" + ", ".join(f"{n}:{v*100:.0f}cm" for n,v in zip(names_used, per_body)) + "]"
+            )
+        except Exception:
+            pass
+    return fired
 
 
 def exceeded_body_height(
@@ -238,8 +291,26 @@ def exceeded_body_height(
     if threshold_adaptive:
         thresh = torch.full_like(height_err, threshold)
         thresh[command.running_ref_root_height < root_height_threshold] = down_threshold
-        return height_err.gt(thresh).any(dim=-1)
-    return height_err.gt(threshold).any(dim=-1)
+        fired = height_err.gt(thresh).any(dim=-1)
+        thresh_used_row0 = thresh[0] if threshold_adaptive else torch.tensor([threshold])
+    else:
+        fired = height_err.gt(threshold).any(dim=-1)
+        thresh_used_row0 = None
+    if _TERM_DBG_COUNTER["n"] < _TERM_DBG_MAX and bool(fired[0].item()):
+        try:
+            per_body = height_err[0].detach().cpu().numpy()
+            names_used = [command.cfg.body_names[i] for i in tracked]
+            worst_idx = int(per_body.argmax())
+            thresh_str = f"threshold={threshold*100:.0f}cm" + (" (adaptive)" if threshold_adaptive else "")
+            _dbg_term(
+                f"body_height({body_names})" if body_names else "body_height(all)",
+                env, command, fired,
+                f"worst={names_used[worst_idx]} z_err={per_body[worst_idx]*100:.1f}cm {thresh_str} "
+                f"all_z_errs=[" + ", ".join(f"{n}:{v*100:.0f}cm" for n,v in zip(names_used, per_body)) + "]"
+            )
+        except Exception:
+            pass
+    return fired
 
 
 def tracking_time_out(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:

@@ -16,6 +16,7 @@ defaults:
   - override /manager_env/events: tracking/level0_4
   - override /manager_env/terminations: tracking/base_adaptive_strict_ori_hu_d04
   - override /manager_env/rewards: tracking/base_5point_local_feet_acc
+  - override /manager_env/recorders: render
 
 use_manager_env: true
 
@@ -99,6 +100,27 @@ manager_env:
         - "right_shoulder_roll_link"
         - "right_elbow_link"
         - "right_wrist_roll_link"
+      # Reset-time state randomization, calibrated for HU_D04 geometry (~1.43m,
+      # longer limbs than G1). The shared base.yaml values produced ~30-40cm
+      # step-1 body drift for HU_D04 — enough to trip the 0.5m foot_pos_xyz
+      # threshold at every reset. Reduced roughly 3x so expected step-1 drift
+      # stays ~10-15cm, leaving real headroom before termination.
+      pose_range:
+        x: [-0.02, 0.02]     # ±2cm  (was ±5cm)
+        y: [-0.02, 0.02]
+        z: [-0.005, 0.005]   # ±5mm
+        roll: [-0.03, 0.03]  # ±1.7°
+        pitch: [-0.03, 0.03]
+        yaw: [-0.05, 0.05]   # ±2.9° (was ±11.5°)
+      velocity_range:
+        x: [-0.2, 0.2]       # ±0.2 m/s (was ±0.5)
+        y: [-0.2, 0.2]
+        z: [-0.05, 0.05]
+        roll: [-0.2, 0.2]
+        pitch: [-0.2, 0.2]
+        yaw: [-0.3, 0.3]
+      joint_position_range: [-0.03, 0.03]  # ±1.7° per joint (was ±5.7°)
+
       num_future_frames: 10
       dt_future_ref_frames: 0.1
       smpl_num_future_frames: 10
@@ -115,10 +137,10 @@ manager_env:
         motion_file: null
         smpl_motion_file: dummy
         smpl_y_up: true
-        # Replace SOMA-derived body_pos_w / body_quat_w with preprocessed MuJoCo-FK
-        # values (preprocess_mjfk.py produces <key>.mjfk.npz next to each PKL).
-        # Resolves SOMA-FK vs PhysX-FK disagreement that made foot_pos_xyz fire at step 1.
-        use_mjfk_override: true
+        # Disabled: with the hu_d04.py body/DOF mapping fix, SOMA's FK (via
+        # torch_humanoid_batch on the same MJCF) should agree with PhysX-FK
+        # to within numerical precision. Override was redundant.
+        use_mjfk_override: false
         asset:
           assetFileName: "hu_d04.xml"
 algo:
